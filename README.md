@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 💰 Smart Finance Manager
 
 A full-stack Python solution that fetches, parses, and visualizes invoice data from your Gmail inbox to help you manage and monitor your daily spending. Built with Django + FastAPI, this project combines automation, analytics, and clean UI to deliver a smart financial dashboard.
@@ -56,3 +57,5 @@ smart_finance_manager/
 
 
 
+=======
+>>>>>>> 22f88b9 (WIP: Save local changes before pull --rebase)
