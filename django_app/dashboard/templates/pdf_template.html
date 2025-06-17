@@ -1,0 +1,14 @@
+<h2>Monthly Invoice Report - {{ user.username }}</h2>
+<p>Total spent: ₹{{ total_spent }}</p>
+<table>
+  <thead><tr><th>Date</th><th>Platform</th><th>Amount</th></tr></thead>
+  <tbody>
+  {% for order in filtered_orders %}
+    <tr>
+      <td>{{ order.date_fetched }}</td>
+      <td>{{ order.platform }}</td>
+      <td>₹{{ order.amount }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>

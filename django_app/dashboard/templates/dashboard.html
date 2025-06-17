@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+<div class="container mt-5">
+  <h1 class="mb-4">Dashboard</h1>
+
+  <!-- ✅ Email Fetch Form -->
+  <div class="mb-5">
+    <h3>📧 Fetch Invoices from Email</h3>
+    <div class="card p-4 bg-light">
+      <form method="post" action="{% url 'fetch_invoices' %}">
+        {% csrf_token %}
+        <div class="row g-3">
+          <div class="col-md-4">
+            <label for="email" class="form-label">Gmail Address</label>
+            <input type="email" class="form-control" name="email" id="email" placeholder="yourname@gmail.com" required>
+          </div>
+          <div class="col-md-4">
+            <label for="password" class="form-label">App Password</label>
+            <input type="password" class="form-control" name="password" id="password" placeholder="16-digit app password" required>
+          </div>
+          <div class="col-md-4 d-flex align-items-end">
+            <button type="submit" class="btn btn-success w-100" onclick="showFetchAlert()">🔐 Fetch Invoices</button>
+          </div>
+        </div>
+      </form>
+      <div id="fetchAlert" class="alert alert-info mt-3 d-none" role="alert">
+        ⏳ Fetching invoices... This may take a few seconds. Thanks for your patience.
+      </div>
+    </div>
+  </div>
+
+  {% if messages %}
+    {% for message in messages %}
+      <div class="alert alert-{{ message.tags }} alert-dismissible fade show mt-3" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+      </div>
+    {% endfor %}
+  {% endif %}
+
+  {% if budget_alerts %}
+  <div class="alert alert-warning mt-3">
+    <ul class="mb-0">
+      {% for alert in budget_alerts %}
+        <li>{{ alert }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if smart_insights %}
+  <div class="alert alert-info mt-3">
+    <strong>Smart Insights:</strong>
+    <ul class="mb-0">
+      {% for insight in smart_insights %}
+        <li>{{ insight }}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <div class="row">
+    <div class="col-md-6">
+      <div class="card border-success mb-3">
+        <div class="card-body text-success">
+          <h5 class="card-title">Budget Limit</h5>
+          <p class="card-text">₹{{ budget_limit }}</p>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="card border-danger mb-3">
+        <div class="card-body text-danger">
+          <h5 class="card-title">Current Spend</h5>
+          <p class="card-text">₹{{ current_spend }}</p>
+          <p>
+            Last Month: ₹{{ last_month_spend }} |
+            {% if spend_diff >= 0 %}
+              🔺 Up ₹{{ spend_diff|floatformat:2 }} ({{ percent_change|floatformat:1 }}%)
+            {% else %}
+              🔻 Down ₹{{ spend_diff|floatformat:2|slice:"1:" }} ({{ percent_change|floatformat:1|slice:"1:" }}%)
+            {% endif %}
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <form method="get" class="row g-3 align-items-end">
+    <div class="col-auto">
+      <label for="month" class="form-label">Filter by Month</label>
+      <input type="month" name="month" id="month" class="form-control" value="{{ selected_month }}">
+    </div>
+    <div class="col-auto">
+      <label for="platform" class="form-label">Platform</label>
+      <select name="platform" id="platform" class="form-select">
+        <option value="">All</option>
+        {% for platform in platform_spend_dict.keys %}
+          <option value="{{ platform|lower }}" {% if selected_platform == platform|lower %}selected{% endif %}>{{ platform }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-auto">
+      <button type="submit" class="btn btn-primary">Apply Filters</button>
+    </div>
+  </form>
+
+  <div class="d-flex justify-content-end mt-3">
+    <a href="{% url 'download_pdf_report' %}?month={{ selected_month }}&platform={{ selected_platform }}" class="btn btn-outline-secondary">
+      📄 Download PDF Report
+    </a>
+  </div>
+
+  <div class="mt-5">
+    <h3>Platform-wise Spending Summary</h3>
+    <table class="table table-bordered">
+      <thead>
+        <tr>
+          <th>Platform</th>
+          <th>Amount Spent (₹)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for platform, amount in platform_spend_dict.items %}
+        <tr>
+          <td>{{ platform }}</td>
+          <td>₹{{ amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <div class="mt-5">
+    <h3>Weekly Spend</h3>
+    <canvas id="weeklySpendChart" height="100"></canvas>
+  </div>
+
+  <div class="mt-5">
+    <h3>Transaction History</h3>
+    <table class="table table-bordered">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Item</th>
+          <th>Platform</th>
+          <th>Amount (₹)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for order in filtered_orders %}
+        <tr>
+          <td>{{ order.date|slice:":10" }}</td>
+          <td>{{ order.item_name }}</td>
+          <td>{{ order.platform }}</td>
+          <td>₹{{ order.amount }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  function showFetchAlert() {
+    const alertBox = document.getElementById('fetchAlert');
+    alertBox.classList.remove('d-none');
+  }
+
+  const rawDailySpendData = JSON.parse('{{ daily_spend|escapejs }}');
+  const completeDates = [...new Set(Object.keys(rawDailySpendData))].sort((a,b) => new Date("2025 " + a) - new Date("2025 " + b));
+  const dataMap = new Map(Object.entries(rawDailySpendData));
+  const minDate = new Date("2025 " + completeDates[completeDates.length - 1]);
+  minDate.setDate(minDate.getDate() - 6);
+
+  const labels = [];
+  const data = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(minDate);
+    d.setDate(d.getDate() + i);
+    const label = d.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' });
+    labels.push(label);
+    data.push(dataMap.get(label) || 0);
+  }
+
+  const ctx = document.getElementById('weeklySpendChart').getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Daily Spend (₹)',
+        data: data,
+        borderWidth: 3,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+        borderColor: 'blue',
+        backgroundColor: 'blue',
+        fill: false,
+        tension: 0.4
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: {
+          display: true,
+          position: 'top',
+          labels: {
+            font: {
+              size: 14,
+              weight: 'bold'
+            }
+          }
+        },
+        tooltip: {
+          callbacks: {
+            label: function(context) {
+              return `₹${context.parsed.y.toLocaleString()}`;
+            }
+          }
+        }
+      },
+      scales: {
+        y: {
+          beginAtZero: true,
+          ticks: {
+            callback: function(value) {
+              return '₹' + value.toLocaleString();
+            }
+          }
+        }
+      }
+    }
+  });
+</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

@@ -1,0 +1,10341 @@
+import imaplib
+import email
+import re
+from bs4 import BeautifulSoup
+from datetime import datetime
+import requests
+from dateutil import parser as date_parser
+
+# ===== CONFIG =====
+IMAP_HOST = "imap.gmail.com"
+EMAIL_USER = "farismullen93@gmail.com"
+EMAIL_PASS = "xwfl krbo jxax txdi"  # App password
+USER_ID = 1
+FASTAPI_ENDPOINT = "http://127.0.0.1:8004/invoices/"
+LOG_FILE = "invoice_log_2025_06.log"
+
+# Target platform senders
+TARGET_SENDERS = {
+    'Amazon': ['auto-confirm@amazon.in'],
+    'Swiggy': ['noreply@swiggy.in'],
+    'Zepto': ['care@cashfreemail.com']
+}
+
+# Fallback platform keyword hints
+PLATFORM_KEYWORDS = {
+    'Amazon': ['amazon'],
+    'Swiggy': ['swiggy', 'instamart'],
+    'Zepto': ['zepto', 'cashfree']
+}
+
+# ===== LOGGING =====
+def log(message):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(message + "\n")
+    print(message)
+
+# ===== MAIN FUNCTION =====
+def fetch_invoice_summary():
+    log("📥 Connecting to IMAP server...")
+    mail = imaplib.IMAP4_SSL(IMAP_HOST)
+    mail.login(EMAIL_USER, EMAIL_PASS)
+    mail.select("inbox")
+
+    requests.delete(f"{FASTAPI_ENDPOINT}{USER_ID}/clear")
+
+    status, messages = mail.search(None, '(UNSEEN)')
+    email_ids = messages[0].split()[-50:]
+
+    summary = []
+    count = 0
+
+    for eid in email_ids:
+        _, msg_data = mail.fetch(eid, "(RFC822)")
+        msg = email.message_from_bytes(msg_data[0][1])
+
+        subject = get_header(msg, "Subject")
+        sender_raw = get_header(msg, "From")
+        internal_ts = msg.get("Date")
+
+        try:
+            email_date = date_parser.parse(internal_ts)
+            now = datetime.now()
+            if email_date.year != now.year or email_date.month != now.month:
+                log(f"📭 Skipped: Email not from this month → {email_date.strftime('%Y-%m-%d')}")
+                continue
+        except Exception as e:
+            log(f"⚠️ Skipping due to date parse error: {internal_ts} ({e})")
+            continue
+
+        sender_email = re.findall(r"<(.*?)>", sender_raw)
+        sender_email = sender_email[0].lower() if sender_email else sender_raw.lower()
+
+        platform = None
+        for plat, senders in TARGET_SENDERS.items():
+            if sender_email in senders:
+                platform = plat
+                break
+
+        if not platform:
+            log(f"🚫 Skipped: Unmatched sender '{sender_email}' with subject '{subject}'")
+            continue
+
+        html = extract_html_from_msg(msg)
+        if not html:
+            log(f"⚠️ Skipping: No HTML in email - Subject: {subject}")
+            continue
+
+        soup = BeautifulSoup(html, "html.parser")
+        text = soup.get_text(separator="\n")
+
+        log("\n====== EMAIL TEXT START ======\n" + text[:1000] + "\n====== EMAIL TEXT END ======\n")
+
+        platform_confirmed = identify_platform(text, sender_email, subject) or platform
+        amount = extract_amount_value(text)
+        txn_date = extract_transaction_date(text) or email_date.date().isoformat()
+
+        if not amount:
+            log(f"⚠️ Skipping: No amount found - Subject: {subject}")
+            continue
+        if not txn_date:
+            log(f"⚠️ Skipping: No date found - Subject: {subject}")
+            continue
+
+        invoice_payload = {
+            "user_id": USER_ID,
+            "platform": platform_confirmed,
+            "amount": amount,
+            "date_fetched": txn_date
+        }
+
+        log(f"📤 Sending to FastAPI: {invoice_payload}")
+        res = requests.post(FASTAPI_ENDPOINT, json=invoice_payload)
+
+        if res.status_code == 200:
+            log(f"✅ Pushed invoice: {platform_confirmed} | ₹{amount}")
+            summary.append(f"{platform_confirmed}: ₹{amount}")
+            count += 1
+        else:
+            log(f"❌ Failed to push {platform_confirmed}: ₹{amount} | Status: {res.status_code}")
+
+        mail.store(eid, '+FLAGS', '\\Seen')
+
+    mail.logout()
+    log(f"✅ Invoice fetching complete. Pushed {count} invoices to FastAPI.")
+    return "\n".join(summary), count
+
+# ===== HELPERS =====
+def get_header(msg, name):
+    raw = msg.get(name, "")
+    decoded = email.header.decode_header(raw)[0]
+    if isinstance(decoded[0], bytes):
+        return decoded[0].decode(decoded[1] or 'utf-8', errors='ignore')
+    return decoded[0]
+
+def extract_html_from_msg(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                return part.get_payload(decode=True).decode("utf-8", errors="ignore")
+    else:
+        if msg.get_content_type() == "text/html":
+            return msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+    return None
+
+def identify_platform(text, sender="", subject=""):
+    sender = sender.lower()
+    subject = subject.lower()
+    text = text.lower()[:1000]
+
+    for platform, hints in PLATFORM_KEYWORDS.items():
+        if any(hint in sender or hint in subject or hint in text for hint in hints):
+            return platform
+    return None
+
+def extract_amount_value(text):
+    lines = text.splitlines()
+    patterns = [r"₹\s?(\d+[\.,]?\d*)", r"Rs\.?\s?(\d+[\.,]?\d*)", r"INR\s?(\d+[\.,]?\d*)"]
+    amounts = []
+
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+
+        if any(keyword in line_lower for keyword in ['total', 'paid', 'amount', 'grand', 'bill']):
+            for pattern in patterns:
+                match = re.search(pattern, line)
+                if match:
+                    try:
+                        amt = float(match.group(1).replace(",", ""))
+                        if amt > 0:
+                            amounts.append(amt)
+                    except:
+                        continue
+
+        elif re.match(r'^\s*₹\s?(\d+[\.,]?\d*)\s*$', line):
+            try:
+                amt = float(re.findall(r'(\d+[\.,]?\d*)', line)[0].replace(",", ""))
+                if amt > 0:
+                    amounts.append(amt)
+            except:
+                continue
+
+        elif any(keyword in line_lower for keyword in ['grand total', 'amount payable']) and i + 1 < len(lines):
+            next_line = lines[i + 1]
+            for pattern in patterns:
+                match = re.search(pattern, next_line)
+                if match:
+                    try:
+                        amt = float(match.group(1).replace(",", ""))
+                        if amt > 0:
+                            amounts.append(amt)
+                    except:
+                        continue
+    return max(amounts) if amounts else None
+
+def extract_transaction_date(text):
+    date_patterns = [
+        r"(?:on\s+)?(\d{1,2}\s+\w+\s+\d{4})",
+        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
+        r"(\d{4}-\d{2}-\d{2})",
+        r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\b.*\d{4}"
+    ]
+
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        for match in matches:
+            try:
+                dt = date_parser.parse(match, fuzzy=True)
+                return dt.date().isoformat()
+            except:
+                continue
+    return None
+
+# ===== RUN SCRIPT =====
+if __name__ == "__main__":
+    fetch_invoice_summary()📥 Connecting to IMAP server...
+🚫 Skipped: Unmatched sender 'donotreply@transactions.upstox.com' with subject 'Weekly Fund Ledger for Securities'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Hireginie - Python Developer and more'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'LLMs in Prod: Security & Compliance'
+🚫 Skipped: Unmatched sender 'bayt.com' with subject 'Apply Now: Python Developer (Networking) _New Grad at Ciena Corporation and 5 jobs for you'
+🚫 Skipped: Unmatched sender 'alerts@hdfcbank.net' with subject 'View: Account update for your HDFC Bank A/c'
+🚫 Skipped: Unmatched sender 'naukrialerts@naukri.com' with subject ' 🔔 Faris, check out jobs applied by other Python Software Developer '
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '💳 Faris, Lifetime FREE RuPay Credit Card with 10X Rewards on Swiggy, Uber, & More!'
+🚫 Skipped: Unmatched sender 'no-reply@kaggle.com' with subject 'Introducing Kaggle Hackathons: Showcase Your AI Skills in the Meta
+ Kaggle Challenge'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Mercor - Frontend Developer and more'
+🚫 Skipped: Unmatched sender 'nse_alerts@nse.co.in' with subject 'Funds/Securities Balance'
+🚫 Skipped: Unmatched sender 'notifications-noreply@linkedin.com' with subject 'Muhammad Thabsheer N P and 2 others commented on your work
+ anniversary.'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'A/c xx7808: Free RuPay Credit Card is Ready!'
+🚫 Skipped: Unmatched sender 'mail@mail.adobe.com' with subject 'Reduce PDF size in just a click 🖱️'
+🚫 Skipped: Unmatched sender 'no-reply@razorpay.com' with subject 'Payment successful for Rentomojo'
+🚫 Skipped: Unmatched sender 'coursera@m.learn.coursera.org' with subject 'Join the Same Network as India’s Top Founders'
+🚫 Skipped: Unmatched sender 'practice@geeksforgeeks.org' with subject 'Welcome to Complete Interview Preparation'
+🚫 Skipped: Unmatched sender 'info@itr.info.codecademy.com' with subject 'Please verify your email address'
+🚫 Skipped: Unmatched sender 'learn@itr.mail.codecademy.com' with subject 'It’s nice to meet you'
+🚫 Skipped: Unmatched sender 'noreply@mailers.zomato.com' with subject 'So, we did some math...'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Hirenza - Python Developer and more'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“python developer”: Expert Executive Recruiters (EER Global) - Sr. Python Developer (AI/ MML platform)'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'How did Tanishq cheat customers?'
+🚫 Skipped: Unmatched sender 'invitations@linkedin.com' with subject 'I want to connect'
+🚫 Skipped: Unmatched sender 'bse alerts' with subject 'Funds / Securities Balance'
+🚫 Skipped: Unmatched sender 'invitations@linkedin.com' with subject 'I want to connect'
+🚫 Skipped: Unmatched sender 'updates-noreply@linkedin.com' with subject 'Indian Startup News recently posted'
+🚫 Skipped: Unmatched sender 'plasmic@substack.com' with subject 'Product updates and Plasmic Marketplace'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Mercor - Python Developer and more'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'more Portkey Stuff'
+🚫 Skipped: Unmatched sender 'linkedin' with subject 'FARIS, thanks for being a valued member'
+🚫 Skipped: Unmatched sender 'estatement@icicibank.com' with subject 'ICICI Bank Statement from 01-05-2025 to 31-05-2025 for XXXXXXXX4546'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk made updates in Thrive'
+🚫 Skipped: Unmatched sender 'no-reply@codesignal.com' with subject 'Cosmo is ready. Let's practice!'
+🚫 Skipped: Unmatched sender 'no-reply@geeksforgeeks.org' with subject 'Another Day, Another Layoff in the News — Are You Safe?'
+🚫 Skipped: Unmatched sender 'learn@itr.mail.codecademy.com' with subject 'What’s your programming personality?'
+📥 Connecting to IMAP server...
+📭 Skipped: Email not from this month → 2025-05-30
+📭 Skipped: Email not from this month → 2025-05-30
+📭 Skipped: Email not from this month → 2025-05-30
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-30
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+📭 Skipped: Email not from this month → 2025-05-31
+🚫 Skipped: Unmatched sender 'services@custcomm.icicibank.com' with subject 'Important: Revision in service charges for Savings Account'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Infosys - Python Developer and more'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🚨 Offer Arrived: Lifetime Free Credit Card + Rs.1250 Voucher for Faris ! Hurry >'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'messaging-digest-noreply@linkedin.com' with subject 'Lathesh just messaged you'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Cozzera - Full Stack Developers (Python Background) and more'
+🚫 Skipped: Unmatched sender 'invitations@linkedin.com' with subject 'I want to connect'
+🚫 Skipped: Unmatched sender 'info@naukri.com' with subject 'Faris Farsan M , Top companies are hiring on Naukri right now!'
+🚫 Skipped: Unmatched sender 'team@datacamp.com' with subject 'Learning for work?'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'A/c xx7808: Update on Lifetime Free Credit Card!'
+🚫 Skipped: Unmatched sender 'noreply@campaigns.upstox.com' with subject 'If you only invest in stocks, this is for you ⭐'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Papigen - Python Developer and more'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'alerts@hdfcbank.net' with subject 'View: Account update for your HDFC Bank A/c'
+🚫 Skipped: Unmatched sender 'bayt.com' with subject 'Senior Software Engineer (Python, DevOps) at Autodesk and other 3 jobs for you'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'Do smokers lungs heal after quitting?'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'Dear Faris, Peace of Mind Transactions 🙂'
+🚫 Skipped: Unmatched sender 'updates-noreply@linkedin.com' with subject 'Mahesh Chand reacted to a post: 🚀 We're Hiring: Java…'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: RN Jobforce - Python Developer and more'
+🚫 Skipped: Unmatched sender 'learn@itr.mail.codecademy.com' with subject 'Answers to your questions'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'invitations@linkedin.com' with subject 'You have an invitation'
+🚫 Skipped: Unmatched sender 'no-reply@codesignal.com' with subject '🚨'
+🚫 Skipped: Unmatched sender 'no-reply@geeksforgeeks.org' with subject '🚨 Viral Drop: 45% OFF on Placement Tayaari with DSA '
+🚫 Skipped: Unmatched sender 'no-reply@accounts.google.com' with subject 'Your Google Account was recovered successfully'
+🚫 Skipped: Unmatched sender 'no-reply@accounts.google.com' with subject 'Security alert'
+🚫 Skipped: Unmatched sender 'no-reply@accounts.google.com' with subject '2-Step Verification turned off'
+🚫 Skipped: Unmatched sender 'no-reply@accounts.google.com' with subject '2-Step Verification turned on'
+🚫 Skipped: Unmatched sender 'no-reply@accounts.google.com' with subject 'Security alert'
+🚫 Skipped: Unmatched sender 'notification@priority.facebookmail.com' with subject 'See 44 updates: about Haider and others'
+✅ Invoice fetching complete. Pushed 0 invoices to FastAPI.
+📥 Connecting to IMAP server...
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Tech Mahindra - Python Developer and more'
+🚫 Skipped: Unmatched sender 'hummer.unnisa@rentickle.com' with subject 'Rentickle : Next Due Date Payment Reminder For Order No. # 800088160'
+🚫 Skipped: Unmatched sender 'onlinecourses@nptel.iitm.ac.in' with subject 'Enroll now and reserve your slot in the upcoming NPTEL+ Workshops!'
+🚫 Skipped: Unmatched sender 'updates-noreply@linkedin.com' with subject 'The Private Markets Forum recently posted'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Cozzera - Python Developer and more'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'LLMs in Prod: Decoupling Prompts'
+🚫 Skipped: Unmatched sender 'swiggy' with subject 'Don't miss out on flat 5% cashback on both Amazon & Flipkart!'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'Will a smoker’s lungs clean themselves if they quit smoking and how long does it take?'
+🚫 Skipped: Unmatched sender 'mail@mail.adobe.com' with subject 'Simplify team feedback with PDFs 🤝'
+🚫 Skipped: Unmatched sender 'googlecommunityteam-noreply@google.com' with subject 'FARIS, here’s how your Android helps you get more done'
+🚫 Skipped: Unmatched sender 'bayt.com' with subject 'Apply Now: Python Developer at S&P Global and 5 jobs for you'
+🚫 Skipped: Unmatched sender 'coursera@m.learn.coursera.org' with subject 'BITS Pilani: Secure your admission early'
+🚫 Skipped: Unmatched sender 'noreply@mailers.zomato.com' with subject 'It's the best day to order burgers '
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: AxisTechnolabs - Python developer and more'
+
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Greetings from Swiggy
+
+
+Your order was delivered in 30 minutes! Rate this lightning fast delivery 
+here
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Order No:
+
+
+207393975620464
+
+
+
+
+
+
+Restaurant
+
+
+Imperial Restaurant Since 1954
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Your Order Summary:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Order No: 
+207393975620464
+
+
+
+
+
+
+
+
+
+
+Order placed at: 
+Wednesday, May 28, 2025 2:56 PM
+
+
+
+
+
+
+
+
+
+
+Order delivered at: 
+Wednesday, May 28, 2025 3:26 PM
+
+
+
+
+
+
+
+
+
+
+Order Status: 
+Delivered
+
+
+
+
+
+
+
+
+
+
+Ordered from:
+
+
+Imperial Restaurant Since 1954
+ 
+
+
+Building No.57, 30Th Cross Road, Tilak Nagar Main Rd, Opposite To Sagar Hospital, 4Th T Block East, Tilak Nagar, Jayanagar, Bengaluru, Karnataka 560076
+
+
+
+
+
+
+
+
+
+
+Delivery To:
+
+
+FARIS FARSAN
+
+
+4th Floor Maruthi Nilaya 59 /79 7th Cross Rd, Bharathi Layout, Balaji Nagar, S.G. Palya, Bengaluru, Karnataka 560029
+
+
+Venkateshwara Layout, S.G. Palya, Bengaluru, Karnataka 560029, India
+
+
+Bengaluru
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 973.0, 'date_fetched': '2025-05-28'}
+✅ Pushed invoice: Swiggy | ₹973.0
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🚨 Offer Arrived: Lifetime Free Credit Card + Rs.1750 Voucher for Faris! Hurry >'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'marketing@royalbrothers.com' with subject 'Burnt out. Lost. Stuck in a cubicle.'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Cisco - APAC - Software QA Engineer - Automation & L2/L3 Testing - 8 to 11 years - Bangalore and more'
+🚫 Skipped: Unmatched sender 'bse alerts' with subject 'Funds / Securities Balance'
+🚫 Skipped: Unmatched sender 'donotreply@transactions.upstox.com' with subject 'Weekly Fund Ledger for Securities'
+🚫 Skipped: Unmatched sender 'linkedin' with subject 'FARIS, thanks for being a valued member'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk made updates in Thrive'
+🚫 Skipped: Unmatched sender 'topemployers@naukrigulf.com' with subject 'Top Employers hiring@ Naukrigulf'
+🚫 Skipped: Unmatched sender 'mail@mail.adobe.com' with subject 'Dive into a world of sensory-driven trends'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '✅ Reminder for Faris, Rs.1750 Vouchers waiting'
+🚫 Skipped: Unmatched sender 'email.campaign@sg.booking.com' with subject 'Up to 20% on Getaway Deals for your favourite crew ☀️'
+🚫 Skipped: Unmatched sender 'payment-report@payu.in' with subject 'Invoice Your Order at AVA LIFESTYLE PRODUCTS & SERVICES PRIVATE LIMITED is successful'
+🚫 Skipped: Unmatched sender 'uber@uber.com' with subject 'One ride, multiple stops'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'services@custcomm.icicibank.com' with subject 'Revised limits for Tax Collected at Source (TCS) on remittances under the Liberalised Remittance Scheme from April 01, 2025'
+🚫 Skipped: Unmatched sender 'google-maps-noreply@google.com' with subject 'Google Maps annual reminder'
+🚫 Skipped: Unmatched sender 'payment-report@payu.in' with subject 'Invoice Your Order at AVA LIFESTYLE PRODUCTS & SERVICES PRIVATE LIMITED is successful'
+🚫 Skipped: Unmatched sender 'newsletter@codewithmosh.com' with subject 'Dealing with Haters: A Lesson from My Career'
+🚫 Skipped: Unmatched sender 'githubeducation@github.com' with subject '🗞️'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Taskify - Junior Software Engineer and more'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'LLMs in Prod: Tackling Hallucinations'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Lead India - Python Developer Trainee and more'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“python developer”: TalentNeuron - Python Developer - Data Engineering'
+🚫 Skipped: Unmatched sender 'uber@uber.com' with subject '50% off on next ride!'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'I got a job offer with a CTC of 65.4 LPA in Gurgaon. My in-hand salary will be 3.3L p...?'
+🚫 Skipped: Unmatched sender 'coursera@m.learn.coursera.org' with subject 'Few hours left | Priority Deadline: May 30'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'A/c xx7808: Update on Lifetime Free Credit Card!'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Lead India - Python Developer Trainee and more'
+🚫 Skipped: Unmatched sender 'noreply@mailers.zomato.com' with subject 'Sign this birthday card '
+🚫 Skipped: Unmatched sender 'swiggy' with subject 'Faris, you know this... 🤓'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'Dear Faris, Safety First, Speed Always!'
+🚫 Skipped: Unmatched sender 'hrm@alphastream.ai' with subject 'Resignation Acceptance - Faris Farsan Mullan'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+✅ Invoice fetching complete. Pushed 1 invoices to FastAPI.
+📥 Connecting to IMAP server...
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Mercor - Python Developer and more'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🚨 Dear Faris, ghibli look? Maybe a privacy hook!'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“python developer”: FlyFlat - Senior Python Web Developer and more'
+🚫 Skipped: Unmatched sender 'swiggy' with subject 'Save up to Rs. 42,000/year! 💳😮'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'Dear Faris, Safety First, Speed Always!'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: AEROCONTACT - Intern - Software Engineer (H/F) - AIRBUS INDIA PRIVATE LIMITED and more'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🤩The all-new NetBanking is here—built for you!'
+🚫 Skipped: Unmatched sender 'customer@slido.com' with subject '4 Tips to make your next meeting more engaging'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🚨 Limited Period Offer: ₹̶1̶2̶5̶0 Rs.1750 Voucher'
+🚫 Skipped: Unmatched sender 'coursera@m.learn.coursera.org' with subject 'Deadline Approaching | May 30 | JGU IRSS'
+🚫 Skipped: Unmatched sender 'redbus' with subject 'The best offer for your next stay! 👇'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Speqto Technologies Pvt Ltd. - Python Developer and more'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“python developer”: Attis - Lead Engineer (React / Node / Python)'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'Can u share ur CGL 2024 final scorecard?'
+🚫 Skipped: Unmatched sender 'swiggy' with subject 'Catches before matches Faris? 🏏'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk mentioned you in New page'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk mentioned you in New page'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk mentioned you in New page'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'LLMs in Prod: Routing'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'touching base with faris's'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: TradeSun®, Inc. - Python Developer and more'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Notso Vivekkk invited you to The Stryv Product Journey'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: Innovate Solutions - Python Developer Trainee and more'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'no-reply@playo.co' with subject '[DGJLNDUC] Your Pickleball slot is reserved!'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject '🚨 Offer Arrived: Lifetime Free Credit Card + Rs.1250 Voucher for Faris! Hurry >'
+🚫 Skipped: Unmatched sender 'hello@mail.hinge.co' with subject 'Get to know someone new'
+🚫 Skipped: Unmatched sender 'updates-noreply@linkedin.com' with subject 'Duyoof Mp reacted to a post: I’m happy to share that I’m…'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Outlier - Python Developer and more'
+🚫 Skipped: Unmatched sender 'vrushank.v@portkey.ai' with subject 'Portkey is Better with Teammates'
+🚫 Skipped: Unmatched sender 'notify@mail.notion.so' with subject 'Vysakh pk made updates in Thrive'
+🚫 Skipped: Unmatched sender 'noreply@campaigns.upstox.com' with subject 'No clarity in stocks? Explore fixed-return ideas till then 🚀'
+🚫 Skipped: Unmatched sender 'invitations@linkedin.com' with subject 'I want to connect'
+🚫 Skipped: Unmatched sender 'similarjobs@naukrigulf.com' with subject '
+     Faris Farsan M, Check out jobs applied by  other Python
+ Developers'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“Python Developer”: WebBoost Solutions by UM - Python Developer Intern and more'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'A/c xx7808: Update on Lifetime Free Credit Card!'
+🚫 Skipped: Unmatched sender 'english-quora-digest@quora.com' with subject 'Are you selected in the final SBI PO result?'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“python developer”: Expert Executive Recruiters (EER Global) - Sr. Python Developer (AI/ MML platform)'
+🚫 Skipped: Unmatched sender 'netmeds' with subject 'First Buy = Flat 25% OFF = Best Buy 🤩💰'
+🚫 Skipped: Unmatched sender 'netmeds' with subject 'That payment option? It pays you back.'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'Dear Faris, Peace of Mind Transactions 🙂'
+🚫 Skipped: Unmatched sender 'bayt.com' with subject 'Senior Python Developer (Django/Flask) at Synechron and other 3 jobs for you'
+🚫 Skipped: Unmatched sender 'jobalerts-noreply@linkedin.com' with subject '“software engineer”: Egnyte - Jr Software Engineer - Nodejs, Python and more'
+🚫 Skipped: Unmatched sender 'no-reply@geeksforgeeks.org' with subject 'Free MERN, DSA and DA Workshops near you!'
+🚫 Skipped: Unmatched sender 'info@newsletters.analyticsvidhya.com' with subject 'Register for Data Decode: Tackle Real Challenges, Win Prizes & Boost Your Career'
+🚫 Skipped: Unmatched sender 'information@hdfcbank.net' with subject 'Faris, ✅ Arrived: ₹̶1̶2̶5̶0̶  Rs.1750 Voucher'
+🚫 Skipped: Unmatched sender 'naukrialerts@naukri.com' with subject ' 🔔 Faris, check out jobs applied by other Python Software Developer '
+🚫 Skipped: Unmatched sender 'noreply@campaigns.upstox.com' with subject '4 new IPOs in logistics, power, hospitality & utility 🚀'
+🚫 Skipped: Unmatched sender 'bayt.com' with subject 'Data Visualization (with SQL and Python) at Pepsico and other 3 jobs for you'
+✅ Invoice fetching complete. Pushed 0 invoices to FastAPI.
+📥 Connecting to IMAP server...
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+NaukriGulf Apply now!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Jobs applied by people similar to you
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Software Engineer (Python)
+              
+
+
+
+
+Bayut.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              1 - 3 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 13 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Software Engineer
+              
+
+
+
+
+TUFYGIUH
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              0 - 1 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates (UAE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 08 May 25
+    
+            
+          
+
+
+
+
+
+            Easy Apply
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                SharePoint Developer
+              
+
+
+
+
+Client of Hire Lebanese
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              2 - 4 Years
+
+
+
+
+
+
+
+              Lebanon - Lebanon
+
+
+
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+Smart Job Alerts
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Search Jobs
+											
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+										Jobs you might be interested in:
+									
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+									Recommended jobs based on your 
+search history:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+QA Module Lead - Routing & Switching testing + Python Automation
+
+
+ Ciena Corporation
+										
+
+
+India
+
+
+May 06, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+QA Lead Engineer - Routing & switching testing + Python Automation
+
+
+ Ciena Corporation
+										
+
+
+India
+
+
+May 06, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Senior Software Engineer- Developer Tooling (AWS, TypeScript, Python)
+
+
+ Autodesk
+										
+
+
+India
+
+
+May 07, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Principal Software Engineer- Developer Tooling (AWS, TypeS
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+I'm almost 18 and I inherited 3.5 million dollars can I live off this for the rest of...?
+My Godson inherited $180,000 when his mother died. He received the money when he was 18. As he deposited the money into Chase Bank, the lady handling his account told him to be wise and not spen…
+ 
+Top stories for FARIS
+ 
+I'm almost 18 and I inherited 3.5 million dollars can I live off this for the rest of life by investing it?
+Barre Flynn
+, Counselor (1975-present)
+ • 
+Answered January 26, 2023
+My Godson inherited $180,000 when his mother died. He received the money when he was 18. As he deposited the money into Chase Bank, the lady handling his account told him t...
+ 
+Read more »
+50.6K
+5K
+ 
+I am with TCS for 8 years now and still the package is around 7L working in the business domain. How can I improve my pay without leaving the company? My total experience is 11 years.
+Deepak Kumar
+, former Developer at Wipro
+ • 
+Answered September 16, 2024
+Here is my story. I was an IBMer for 11 years (2011–2
+====== EMAIL TEXT END ======
+⚠️ Skipping: No amount found - Subject: I'm almost 18 and I inherited 3.5 million dollars can I live off this for the rest of...?
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Today, we announced the…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Vysakh P K
+ liked this 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Aadit Palicha 
+ 
+ 
+ 
+ Co-Founder/CEO @ Zepto | Believer in Indian Dynamism… 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Follow 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Today, we announced the launch of Zepto Atom - an advanced data insights subscription for Consumer Brands in… 
+ 
+ 
+ see more 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 15,160 
+ 
+·
+ 
+ 583 Comments 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+====== EMAIL TEXT END ======
+⚠️ Skipping: No amount found - Subject: Vysakh P K reacted to a post: Today, we announced the…
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+ 
+ 
+Dear Faris Farsan Mullan,
+Transfer funds overseas 24*7 seamlessly through Internet Banking and the iMobile app. The transaction limit has now increased to USD 75000 (and its equivalent) within the overall transfer limit of USD 250000 per financial year under the Liberalised Remittance Scheme for resident individuals. 
+ 
+Transfer now and experience a safe and secure overseas money transfer journey.
+ 
+ 
+To know more, please call only
+on
+ 
+ 
+ 
+Stay safe from fraudsters. Do not call any other number.
+
+For further assistance
+Chat with us
+ 
+ ❘ 
+ 
+Locate a branch
+ 
+ ❘ 
+ 
+WhatsApp us
+ 
+Access your account
+Internet Banking
+ 
+ ❘ 
+ 
+iMobile
+ 
+ 
+Sincerely,
+Team ICICI Bank 
+ 
+ 
+ 
+ 
+This is a system generated e-mail. Please do not reply. 
+T&Cs 
+ 
+ ❘ 
+ 
+Disclaimer
+
+
+ ❘ 
+ 
+ 
+ 
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Avathon Fullstack Developer (Python & Reactjs): Who We Are & Why Join UsAvathon is…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+software engineer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in Bengaluru match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Fullstack Developer (Python & Reactjs) 
+ 
+ 
+ 
+ 
+ 
+ Avathon · Bengaluru (On-site) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Software Engineer - II(Backend) 
+ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+Portkey Virtual Keys
+
+
+
+
+
+
+
+
+Hey FARIS,
+
+
+Here's a quick run down on why you should create virtual keys for 
+faris's
+
+
+They're a way to manage your API access more securely - instead of using keys directly, you use these virtual keys. Think of them like disposable credit cards.
+
+
+Here's how they help:
+
+
+
+
+Easy key rotation
+ without changing code
+
+
+More control
+ -  set budgets & rate limits
+
+
+Better tracking
+ - request attribution & usage monitoring
+
+
+
+
+I know it might sound complicated, but it's actually super easy to set up. Look:
+
+
+
+
+Once you've got your virtual key, using it is straightforward. Here's a quick example:
+
+
+#Python example - more in docs
+from portkey_ai import Portkey
+
+portkey = Portkey(
+    api_key="PORTKEY_API_KEY",
+    virtual_key="YOUR_NEW_VIRTUAL_KEY_SLUG"
+)
+
+# Use portkey for all your API requests
+response = portkey.chat.completions.create(
+    model="gpt-3.5-turbo",
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+        
+
+
+Rest as
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Efficiency in your pocket 📱
+
+
+
+
+
+
+
+
+
+
+
+
+Edit and sign documents on the go with Acrobat Pro.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Sign and go with ease.
+
+
+
+
+
+
+Sign documents wherever you are with Acrobat Pro. Our advanced tools let you edit and manage PDFs on any device. Stay efficient and work smarter, anywhere.
+
+
+
+
+
+
+
+
+
+
+Get started
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Adobe services, like Adobe Document Cloud, are available only to users 13 and older. Use of Adobe services and applications requires agreement with the applicable 
+Terms of Use
+ and the 
+Adobe Privacy Policy
+.
+
+  Adobe, Adobe (Stylized), Creative Cloud, the Creative Cloud logo, and Document Cloud are either registered trademarks or trademarks of Adobe in the United States and/or other countries.
+
+  This is not a comprehensive list of all Adobe trademarks. For a full list, refer to the 
+Adobe Trademark Guidelines
+. All other trademarks are 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+Ever felt like you're just figuring things out as you go? That means you're trying — and that’s exactly how every successful person starts. Whether you're a future restaurateur, entrepreneur, or just exploring what's next, a little try goes a long way. This mail is your sign to start small, start bold, but most importantly — start now. Maybe even with a new dish?
+
+
+
+
+
+
+
+
+Click here to unsubscribe - 
+unsubscribe here.
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+Python Developer
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Check out jobs applied by other Python Software Developer  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+Python Developer
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Diverse Lynx
+
+
+ 
+
+
+
+3.7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+Bengaluru
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+Backend Developer
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Assiduus Distribution
+
+
+ 
+
+
+
+3.8
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+Bengaluru
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+Python Developer
+ 
+
+
+
+
+
+
+ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+NaukriGulf Apply now!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Jobs applied by people similar to you
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                SharePoint Developer
+              
+
+
+
+
+Client of Salt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 6 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Java Developer
+              
+
+
+
+
+Tej Infotech
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              1 - 3 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 12 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Software Developer Java
+              
+
+
+
+
+Anexas Consulting 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              1 - 6 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates (UAE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+      
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+greytHR Python Developer - SDE-2: Responsibilities• Lead the design, development…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+Python Developer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in India match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer - SDE-2 
+ 
+ 
+ 
+ 
+ 
+ greytHR · India (Remote) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Actively recruiting 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+OND_LTF_Feedom_HDFC-
+ 
+ 
+ 
+ 
+ 
+
+
+₹1,250 voucher, Zero joining/renewal fee, 10X CashPoints & More. Get your Card today!
+ 
+
+
+ 
+ 
+
+
+
+
+ 
+ 
+
+
+
+
+ 
+ 
+
+
+ 
+ 
+ 
+
+
+Get Your Lifetime Free Card
+ 
+ 
+
+
+ 
+
+
+ 
+ 
+
+
+ 
+
+
+ 
+ 
+
+
+Get Your Lifetime Free Card
+ 
+ 
+
+
+ 
+
+
+ 
+
+
+
+
+ Lifetime FREE Offer is valid only when applied via the above link, Offer valid till May 31, 2025
+If you're unable to view this offer, please contact us
+*T&C apply on voucher | 
+Unsubscribe
+
+
+**Big Basket, BookMyshow, OYO, Swiggy & Uber
+
+
+====== EMAIL TEXT END ======
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 1250.0, 'date_fetched': '2025-05-31'}
+✅ Pushed invoice: Swiggy | ₹1250.0
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+   
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Greetings from Swiggy👋
+Your Swiggy Instamart order id: 
+206710939018393
+ was successfully delivered. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Deliver To: 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+4th Floor Maruthi Nilaya 59 /79 7th Cross Rd, Bharathi Layout, Balaji Nagar, S.G. Palya, Bengaluru, Karnataka 560029  Venkateshwara Layout, S.G. Palya, Bengaluru, Karnataka 560029, India
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Order Items
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Nestle KitKat Lovebreak, 4 Finger, Chocolate Coated Wafer
+ 
+₹35.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Britannia Gobbles Bar Cake Fruity Fun
+ 
+₹27.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Bare Anatomy Anti Dandruff Shampoo | Salicylic Acid | Shampoo for Dry and Frizzy Hair
+ 
+₹501.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Sample- Dove Hair Mask
+ 
+₹0.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Nescafe Cafe Style Cold Coffee, Iced Latte
+ 
+₹46.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Sample - Fresh Navdha Shampoo
+ 
+₹0.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Order Summary
+ 
+ 
+ 
+ 
+ 
+ 
+ Item Bill 
+ 
+₹609.00
+ 
+ 
+ 
+ Handling Fee 
+ 
+₹11.56
+ 
+ 
+ 
+ Delivery Partner 
+====== EMAIL TEXT END ======
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 621.0, 'date_fetched': '2025-05-20'}
+✅ Pushed invoice: Swiggy | ₹621.0
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Email Template
+
+
+
+
+
+
+
+
+Tap to know more
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ 
+‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Join us in two days
+
+
+͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ ‌     ﻿ ͏ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Palcode.ai 1-2 Year Python Backend Engineer - Remote: The CompanyAt Palcode.ai, We're on a mission to…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+software engineer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in Bengaluru match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1-2 Year Python Backend Engineer - Remote 
+ 
+ 
+ 
+ 
+ 
+ Palcode.ai · Bengaluru (Remote) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Dev
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Effective from 21 June 2025 ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  ͏ ‌   ﻿  
+
+
+ 
+ 
+Pricing change
+We wanted to give you a quick heads-up.
+A few parts of our pricing on the platform is changing, effective from 21 June 2025.
+Current
+Revised
+Brokerage
+Rs.20 or 0.1%
+(Minimum Rs.2)
+Rs.20 or 0.1%
+(Minimum Rs.5)
+DP charges
+Rs.18.5 
+CDSL:
+Rs.3.5
+DP (Groww):
+Rs.15
+For women investors:
+CDSL:
+Rs.3.25
+DP (Groww):
+Rs.15.25
+Charged per day per ISIN
+Rs.20
+CDSL:
+Rs.3.5
+DP (Groww):
+Rs.16.5
+For women investors:
+CDSL:
+Rs.3.25
+DP (Groww):
+Rs.16.75
+Charged per sell transaction
+MTF interest charges
+15.75% p.a. for funded amount < 25L
+9.75% p.a. fo
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+Hi FARIS,
+Crunched some data & calculated some 
+actual
+ 
+results
+ that Portkey users are seeing:
+On answering user questions via LLMs, as high as 
+60%  questions could be redundant
+. Serving them from a 
+semantic cache
+ makes your app 
+20x faster
+ and 
+costs you 
+ZERO tokens
+!
+LLM API requests often get rate-limited, timeout or just fail. Using 
+automatic exponential retries
+ can 
+lower your error rate from ~8% to ~0.2%
+.
+Azure’s OpenAI latencies generally have been 
+~30% faster
+ than OpenAI themselves, which makes these 2 great candidates to set up as 
+fallbacks
+.
+quick question - found the analytics & logs worthwhile so far?
+Vrushank
+Developer Success
+
+
+If you'd rather not hear from me, simply unsubscribe 
+here.
+ Your inbox, your choice.
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+Why did Jeff Bezos leave Amazon?
+The news was a bombshell in the world of Tech and investment. After nearly 27 years at the head of Amazon, Jeff Bezos has just announced that he will be stepping down as CEO at the end of the fi…
+ 
+Top stories for FARIS
+ 
+Why did Jeff Bezos leave Amazon?
+Sylvain Saurel
+ • 
+Answered February 4, 2021
+The news was a bombshell in the world of Tech and investment. After nearly 27 years at the head of Amazon, Jeff Bezos has just announced that he will be stepping down as CE...
+ 
+Read more »
+9.5K
+306
+ 
+When someone dies in their sleep, people assume that that's the best way to die. But I'd say about 99% of the time, they feel themselves dying even in their sleep, and they struggle to breathe, and they actually die from suffocation. Is this likely?
+Samantha Kelly
+, Hospice Volunteer
+ • 
+Answered October 27, 2024
+I’m a hospice volunteer, and have been with many people as they died. I believe you are assessing the situation from your own fears. Here is what I hav
+====== EMAIL TEXT END ======
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Amazon', 'amount': 25961.0, 'date_fetched': '2021-02-04'}
+✅ Pushed invoice: Amazon | ₹25961.0
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+👤 Mohammed Basil, Senior Network Specialist is waiting for your response.
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Mohammed is waiting for your response 
+ 
+ 
+ 
+ 
+ Mohammed Basil invited you to connect 
+ 4 days ago 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Mohammed Basil 
+ 
+ 
+Network & Security Engineer : CCNP ENCORE…
+ 
+Bengaluru
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 21 connections in common 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Accept 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ View Invitation 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+Graphic made with Visme
+Hey there, FARIS
+Starting something new can feel like a blank canvas, but it doesn’t have to be. We’ve recently released a set of new template categories to help you dive straight into the creative process.
+Here’s 
+a short recap of our newest template categories
+:
+Planner Templates 
+Organizing your day or planning your next big project is easier than ever with our new planner templates. These ready-to-use designs help you 
+map out detailed tasks, events, and timelines that are easily digestible visually
+. Perfect for keeping your team or clients on track and ensuring nothing is overlooked.
+View Planner Templates
+Price List Templates
+Our price list templates make displaying your business offerings quick and simple. Perfect for creating 
+a printed price list for your storefront or a digital version for your website & social media
+. With AI Resize, adjusting your price list to the correct dimensions for your platform takes a few seconds.
+View Price List
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+It’s the day of everyone’s favourite drink 😍 Tap to find out what it is - and how it solves so many of your problems! Enjoy it with combos starting at just ₹100 - only for today. So go on, refresh yourself. Your favourite drink is waiting.
+
+
+
+
+
+
+
+
+Click here to unsubscribe - 
+unsubscribe here.
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+InvestM Technology LLC Full-Stack Python Developer: Job Title: Full-Stack Python Developer (Alerting…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+python developer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 1 new job in Jeddah matches your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Full-Stack Python Developer 
+ 
+ 
+ 
+ 
+ 
+ InvestM Technology LLC · EMEA (Remote) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Actively recruiting 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+GeneralText Mailer April2023
+
+
+Get your Card + Rs.1250 Voucher >>
+
+
+
+
+
+
+
+
+Dear Faris,
+
+
+
+
+Thank you for being a valued customer of HDFC Bank.
+We are pleased to inform you of your eligibility for our 
+LIFETIME FREE  Credit Card + ₹1250 Vouchers
+, with zero paperwork.
+
+
+Claim your Offer before Eligibility changes!
+
+
+
+
+Get your Free Card >
+
+
+
+
+Warm regards, 
+
+
+HDFC Bank
+
+
+
+
+ Lifetime free offer valid till June 9, 2025 | If you're unable to view this offer, please contact us 
+
+
+
+
+*Terms and conditions apply | 
+Unsubscribe
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+NaukriGulf Apply now!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Jobs applied by people similar to you
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                SharePoint Developer
+              
+
+
+
+
+Client of Salt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 6 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Machine Learning Engineer
+              
+
+
+
+
+aspire
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 4 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Software Developer Java
+              
+
+
+
+
+Confidential Company
+
+
+
+
+
+
+
+
+
+
+
+
+
+              1 - 6 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates (UAE)
+
+
+
+
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Kyndryl India Python Developer: Who We AreAt Kyndryl, we design, build, manage…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+Python Developer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in India match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer 
+ 
+ 
+ 
+ 
+ 
+ Kyndryl India · Noida (Remote) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer 
+ 
+ 
+ 
+ 
+ 
+ Brillius Technologies · Hyderabad (On-site) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+   
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Greetings from Swiggy👋
+Your Swiggy Instamart order id: 
+206795076919179
+ was successfully delivered. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Deliver To: 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+4th Floor Maruthi Nilaya 59 /79 7th Cross Rd, Bharathi Layout, Balaji Nagar, S.G. Palya, Bengaluru, Karnataka 560029  Venkateshwara Layout, S.G. Palya, Bengaluru, Karnataka 560029, India
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Order Items
+ 
+ 
+ 
+ 
+ 
+ 
+1 x B Natural Guava Juice, Goodness of fiber
+ 
+₹70.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Sunfeast Caker Swiss Roll With Choco
+ 
+₹10.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Nestle KitKat Lovebreak, 4 Finger, Chocolate Coated Wafer
+ 
+₹35.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Kwality Wall's Cornetto Double Chocolate Frozen Dessert Cone
+ 
+₹40.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Coca-Cola Diet Coke Can
+ 
+₹35.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+1 x Cadbury Chocobakes Choc Layered Cake
+ 
+₹10.00
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Order Summary
+ 
+ 
+ 
+ 
+ 
+ 
+ Item Bill 
+ 
+₹200.00
+ 
+ 
+ 
+ Handling Fee 
+ 
+₹11.56
+ 
+ 
+ 
+ Delivery Partner Fee 
+ 
+₹0.00
+ 
+ 
+ 
+
+====== EMAIL TEXT END ======
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 212.0, 'date_fetched': '2025-05-21'}
+✅ Pushed invoice: Swiggy | ₹212.0
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+Dear Faris Farsan Mullan, what a remarkable year you have had with ICICI Bank!
+It's your 1st anniversary with ICICI Bank! You have played your Banking game very well in the last 12 months. As we wrap up this level, check
+out the highlights of your financial adventure. We have some new solutions to boost your game, as you level-up for next year's financial quest.
+ 
+Your journey was an exhilarating ride, with plenty of highlights along the way. Here is a quick snapshot of your financial journey:
+ 
+ 
+Subscription : You have purchased subscription(s) of Hotstar
+ 
+Branch visits: 0. You are a Digital Customer with zero Branch Visits.
+ 
+ATM visits: 0. You are a Digital Customer with zero ATM Visits
+ 
+ 
+FD – Money invested in a 1-year ICICI Bank FD would have given at least 
+6.7%
+ risk-free returns year on year, providing your portfolio with a balance of security and growth.
+Sovereign Gold Bonds – Investments are linked to market value of Gold +
+2.5%
+ interest per annum and no GST on 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+I got the gift NO man expects for his Birthday 🎁
+
+
+
+
+
+
+
+
+560/1, Boomi Plaza, 4th and 5th Floor, 4th Cross, CMH Road, Indiranagar, Bengaluru, Bengaluru Urban, Karnataka 560 038
+
+
+Enquiries - support@royalbrothers.com
+ 
+
+
+ 
+Terms & Conditions
+ 
+ 
+Privacy Policy
+
+
+Every adventure meets its end. If you're ready to conclude this amazing ride  click 
+Unsubscribe
+ . 
+We’ll miss having along the journey. 
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+I’m happy to share that I’m…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Duyoof Mp
+ liked this 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Fatheema Anna V 
+ 
+ 
+ 
+ Aspiring Software Tester | B.Tech in Information… 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Follow 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ I’m happy to share that I’m starting a new position as Software Testing Intern at DataHex! 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 36 
+ 
+·
+ 
+ 11 Comments 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+====== EMAIL TEXT END ======
+⚠️ Skipping: No amount found - Subject: Duyoof Mp reacted to a post: I’m happy to share that I’m…
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+The Law Reporters Python Developer: Job Summary:We are looking for a passionate and…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+software engineer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in Bengaluru match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer 
+ 
+ 
+ 
+ 
+ 
+ The Law Reporters · Bengaluru (On-site) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Software Engineer I 
+ 
+ 
+ 
+ 
+ 
+ UiPath · Beng
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+Portkey Virtual Keys
+
+
+
+
+
+
+
+
+Hey FARIS,
+
+
+Let me quickly walk you through our comprehensive observability suite today!
+
+
+Our OpenTelemetry-compliant observability suite gives you:
+
+
+
+
+
+Logging
+: Detailed request history enabling easier monitoring and debugging
+
+
+
+Request tracing
+: Visualize complex multi-step AI processes such as agentic flows end-to-end with ease
+
+
+
+
+Analytics
+: Costs, Tokens, & 40+ realtime metrics you need to make informed decisions
+
+
+
+
+
+
+You get all this 
+and more
+ in exchange for a 3 line integration:
+
+
+#Python example - more in docs
+from portkey_ai import Portkey
+
+portkey = Portkey(
+    api_key="PORTKEY_API_KEY",
+    virtual_key="YOUR_NEW_VIRTUAL_KEY_SLUG"
+)
+
+
+Check out our docs to know more:
+
+
+🔗 
+Observability
+
+
+Team Portkey
+
+
+
+
+Need help? Feel free to reply to this email or hop onto our 
+Discord
+
+
+
+
+
+
+
+      If you don't want to receive onboarding emails, you can 
+unsubscribe
+ here.
+    
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+ [Model Launch] Devstral Is Now on Kaggle! 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                Hi FARIS FARSAN,
+                              
+
+
+Introducing Devstral, an agentic LLM for software engineering tasks developed by Mistral AI and All Hands AI, now available on Kaggle Models. Devstral is open-sourced under the Apache 2.0 license and supports a range of software engineering tasks, including codebase navigation and multi-file editing.
+
+
+The model has 24 billion parameters and fine tuned from Mistral-Small-3.1, therefore it has a long context window of up to 128k tokens. The model debuts as the #1 open source model on SWE-bench.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+     Access Devstral  
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Key Features:
+
+
+
+
+
+
+ Deployment Options: Runs locally on devices like an RTX 4090 or Mac with 32GB RAM, and scales to enterprise environments.
+
+
+
+ Agentic Coding Support: Handles tasks such as editing multiple files and
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Document
+
+
+
+
+
+
+
+
+
+
+
+
+Dear Investor,
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+With reference to BSE notices 20210922-64 dated September 22, 2021 and 20211022-44 dated October 22, 2021, Stock Brokers are required to upload segregation and monitoring of collateral at client level on daily basis.
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+Your Stockbroker UPSTOX SECURITIES PVT. LTD. has reported the details of Funds balance and Securities balance as on 10/05/2025 to Clearing Corporations, is attached.
+
+
+
+
+
+
+
+
+Please follow the procedure given below for opening the attachment:
+
+
+
+
+
+
+         1. Click on the attachment provided with this email.
+
+			         2. You will be prompted for your password.
+
+			         3. The password is your PAN in upper case
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+Please note that negative number in the file represents debit balance/balance payable by you. 
+Also, the funds and securities balances provided are what is maintained with your broker and does not include balance in your personal bank account and demat accou
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+Bayt.com
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+																Recommended Jobs For You
+															
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Python Developer
+
+
+ Kyndryl Inc
+																			
+
+
+India
+
+
+May 21, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Python Developer with AWS/Azure
+
+
+ Siemens
+																			
+
+
+Bengaluru,  India 
+
+
+May 21, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Full Stack Python Developer (Cloud, Mobile, IoT & Agile Expertise)
+
+
+ Synechron
+																			
+
+
+ India
+
+
+May 21, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Full Stack Python Developer (Cloud, IoT, Blockchain & Agile Expertise)
+
+
+ Synechron
+																			
+
+
+ India
+
+
+May 21, 2025
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Industrial Solutions Engineer - OPC UA/PCS7 & Python Specialist
+
+
+ Siemen
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ROS Email
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hey Faris!
+ 
+We’ve made a few updates to our 
+Community Guidelines
+ – nothing brand new, just making things clearer so you know what’s OK (and what’s definitely not). 
+Here’s a quick look at what’s changed:
+
+
+
+
+Same rule, new location – you can only have one Tinder account at a time. 
+
+
+We’ve added a reminder that if someone asks you to send money or invest in something, it’s probably a scam.
+
+
+It’s never OK to target or report someone based on their identity – and we’ve added more detail about who that includes. 
+
+
+We’ve added guidance around privacy – it’s OK to talk to friends or family about someone you’re meeting, but don’t share their personal info publicly. 
+
+
+The same guidelines apply when you’re speaking with Tinder support or anyone at Match Group. 
+
+
+
+ 
+By continuing to use Tinder after 
+21 May 2025
+, you’re agreeing to abide by these rules. 
+ Thanks for ke
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+Quant Analytics Analyst - SQL, Python
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ Check out jobs applied by other Python Software Developer  
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+Quant Analytics Analyst - SQL, Python
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+JPMorgan Chase Bank
+
+
+ 
+
+
+
+3.9
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+Bengaluru
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+Director, Data Scientist
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+S&P Global Market I...
+
+
+ 
+
+
+
+4.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+Ahmedabad
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+Explore the Borana Weaves & Belrise Industries IPO
+
+
+Explore the Borana Weaves & Belrise Industries IPO
+
+
+
+
+The company manufactures unbleached synthetic grey fabric and polyester textured yarn for the fashion, home décor, and technical textiles industries. It operates three fully equipped textile units for end-to-end production.
+Key highlights: 
+Market capitalisation: ₹575.54 Cr.
+Assets as of Sept 2024: 15 texturising machines, 6 warping
+machines, 700 water jet looms, and 10 folding machines.
+
+
+Explore now
+
+
+ 
+
+
+The company manufactures safety-critical automotive components for 2W, 3W, 4W, and commercial vehicles, catering to 27 global OEMs. With 15 plants across India, it offers a vertically integrated portfolio across chassis, suspension, exhaust, and polymer systems.
+Key highlights: 
+Market capitalisation: ₹8,008.91 Cr.
+Trusted by top OEMs like Bajaj, Tata, Mahindra, and Jaguar Land Rover
+
+
+Explore now
+
+
+ 
+Explore the details of the IPOs below:
+Interested in these IPOs? Log in to y
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+HerKey Junior Python developer: Location : Bangalore(Hybrid)Exp : 1 to 3 yearsThe…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+Python Developer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in India match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Junior Python developer 
+ 
+ 
+ 
+ 
+ 
+ HerKey · Bengaluru (Hybrid) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Actively recruiting 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Easy Apply 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+NaukriGulf Apply now!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Jobs applied by people similar to you
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                SharePoint Developer
+              
+
+
+
+
+Client of Salt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 6 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Machine Learning Engineer
+              
+
+
+
+
+aspire
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 4 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Software Developer Java
+              
+
+
+
+
+Confidential Company
+
+
+
+
+
+
+
+
+
+
+
+
+
+              1 - 6 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates (UAE)
+
+
+
+
+
+
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+            📩 Mosh Bytes #27: Your weekly coding tips.‌
+            
+
+               
+ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌ ‌
+            
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Hi Faris, 👋
+
+
+
+
+Happy Thursday! Welcome to another edition of Mosh Bytes. 
+
+
+
+
+This week, I’m sharing some time management tips that have made a huge difference in my productivity over the years. These aren’t just generic tips – they come straight from my personal experience as a developer. This is the exact routine I practice every day to stay focused and productive.
+
+
+
+
+1. Start Your Day with a To-Do List
+
+
+Begin your day with a list of tasks. This list serves as your map for the rest of the day. Without this map, it's easy to get lost in thousands of lines of code, and by the end of the day, you might w
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Mercor Python Developer: We are hiring software engineers to assist a…
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Your job alert for 
+software engineer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 30+ new jobs in Bengaluru match your preferences. 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer 
+ 
+ 
+ 
+ 
+ 
+ Mercor · India (Remote) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Python Developer (SDE-1) 
+ 
+ 
+ 
+ 
+ 
+ Murf AI · Bengaluru (On-site) 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Actively recruiti
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+Rs. 2250 Voucher CC mailer
+ 
+ 
+ 
+
+
+With 👉Lifetime Free👈 Credit Card! Offer Valid till 31 May only!
+ 
+
+
+ 
+ 
+
+
+
+
+ 
+
+
+ 
+Get ₹1750 Vouchers
+
+
+with your LIFETIME FREE Credit Card!
+ 
+Limited Period Offer!
+
+
+ 
+ 
+ 
+Apply Today ➔
+ 
+ 
+
+
+The Voucher value will be as per your Card Application date:
+
+
+
+
+
+
+
+
+Card Application Date
+
+
+Voucher Value
+
+
+
+
+
+
+1-21 May'25
+
+
+Rs.1250
+
+
+
+
+
+
+22-31 May'25
+
+
+Rs.1750
+
+
+
+
+
+
+1 June'25 onwards
+
+
+Offer expires
+
+
+
+
+
+
+ 
+
+
+ 
+
+
+ 
+ 
+Apply Today ➔
+ 
+
+
+
+
+Lifetime free offer valid only via above link, valid till June 9, 2025 | If you're unable to view this offer, please contact us 
+*T&Cs apply | 
+Unsubscribe
+ 
+
+
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+Today, we’re introducing Claude Opus 4 and Claude Sonnet 4, setting new standards for coding, advanced reasoning, and AI agents.
+Hello,
+  
+Today, we’re introducing 
+Claude Opus 4 and Claude Sonnet 4
+, setting new standards for coding, advanced reasoning, and AI agents.
+ 
+Here’s what we’re launching on the Anthropic API:
+ 
+Claude Opus 4
+: The world’s best coding model, with sustained performance on complex, long-running tasks and agent workflows.
+ 
+Claude Sonnet 4
+: A significant upgrade to Claude Sonnet 3.7, surpassing its predecessor across coding and reasoning while responding more precisely to your instructions.
+ Extended thinking with tool use (beta)
+:
+ 
+Both models can use tools during extended thinking, allowing Claude to alternate between reasoning and tool use to improve responses.
+ New model capabilities
+:
+ 
+When given local file access, both models can now extract and save key facts from conversations into local 'memory files,' maintaining continuity across sessions and build
+====== EMAIL TEXT END ======
+⚠️ Skipping: No amount found - Subject: Introducing Claude 4
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+50% off on your next ride! Limited period offer. T&Cs apply
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ­
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Enjoy savings up to ₹75
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Faris,   we miss you! 50% savings up to ₹75 on your next ride! Limited period offer. T&Cs apply
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Book a ride now!
+ 
+ 
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+He
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Immerse yourself in a trending collection
+
+
+
+
+
+
+
+
+
+
+
+
+Explore entrancing videos and trending assets that stir up the senses.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Take an immersive journey.
+
+
+
+
+
+
+This trending video collection is perfect for pulling viewers into your social posts or brand videos.
+
+
+
+
+
+
+
+
+
+
+Explore now
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Adobe Stock/flashmovie
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Adobe Stock/StevePFX
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+A trend that ignites the senses.
+
+
+
+
+
+
+Elevate your work with video templates that showcase multi-sensory experiences.
+
+
+
+
+
+
+Try it now
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Use Remove Background to get to your final asset. Generative AI tools are powered by Adobe Firefly.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Customise now
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Adobe services, like Adobe Creative 
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+How bad is type 2 diabetes?
+I had two uncles who refused to follow reasonable guidelines for type 2 diabetes. They ate too much of carb-laden foods, failed to measure their blood sugar to use adequate insulin, had beer nea…
+ 
+Top stories for FARIS
+ 
+How bad is type 2 diabetes?
+Eleanor Murray
+, Science will show the best therapy to use
+ • 
+Answered November 20, 2016
+I had two uncles who refused to follow reasonable guidelines for type 2 diabetes. They ate too much of carb-laden foods, failed to measure their blood sugar to use adequate...
+ 
+Read more »
+586
+61
+ 
+Is 19 too old for MBBS? Will I feel out of place if join at this age? I'm a bit anxious.
+Mukul Shrivastava
+, MBBS from All India Institute of Medical Sciences (2027)
+ • 
+Answered June 14, 2024
+I don't mean to belittle you, but this question almost makes me laugh😂.
+ 
+See, NEET is one of those exams where people are obsessed with clearing it even when they'll realize...
+ 
+Read more »
+262
+26
+ 
+Why did Krishna choose not to give his 
+====== EMAIL TEXT END ======
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Amazon', 'amount': 5.0, 'date_fetched': '2016-11-20'}
+✅ Pushed invoice: Amazon | ₹5.0
+====== EMAIL TEXT START ======
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+You’re getting noticed
+ 
+ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏ ͏  
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+Your profile is looking great
+ 
+ 
+ 
+ 
+ 
+Your work and accomplishments are being recognized
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 9 
+ 
+ 
+ 
+ profile views 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ See who’s looking 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Get the new LinkedIn desktop app 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ Also available on mobile 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ This email was intended for FARIS FARSAN (Software Engineer at Alphastream.ai) 
+ 
+ 
+ 
+ 
+Learn why we included this.
+ 
+ 
+ 
+ 
+You are receiving L
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+====== EMAIL TEXT START ======
+
+
+
+
+
+
+NaukriGulf Apply now!
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Jobs applied by people similar to you
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                SharePoint Developer
+              
+
+
+
+
+Client of Salt
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              3 - 6 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 16 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Junior .Net Developer
+              
+
+
+
+
+Paradigm Solutions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              0 - 3 Years
+
+
+
+
+
+
+
+              Dubai - United Arab Emirates
+
+
+
+
+
+
+
+
+
+
+
+
+
+            Posted on 19 May 25
+    
+            
+          
+          
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                Home Finance Loan Operations Officer
+              
+
+
+
+
+Lancesoft
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+              2 - 8 Years
+
+
+
+
+
+
+
+              Abu Dhabi - United Arab Emirates (UAE)
+
+
+====== EMAIL TEXT END ======
+🚫 Skipped: Could not detect platform from subject or body
+✅ Invoice fetching complete. Pushed 5 invoices to FastAPI.

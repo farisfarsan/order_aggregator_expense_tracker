@@ -1,0 +1,192 @@
+📥 Connecting to IMAP server (universal PDF mode)...
+🔒 Skipped encrypted PDF: invoice_1749408379.158138.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408382.474033.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408390.931489.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408398.396235.pdf
+⚠️ Skipped: Not from known platforms or empty text
+⚠️ Skipped: Not from known platforms or empty text
+📥 Connecting to IMAP server (universal PDF mode)...
+🗑️ Cleared existing invoices for user.
+🔒 Skipped encrypted PDF: invoice_1749408744.391916.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408748.546273.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408756.369574.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408764.468297.pdf
+⚠️ Skipped: Not from known platforms or empty text
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408809.492187.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408810.18537.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 960.75, 'date_fetched': '2025-05-28'}
+✅ Pushed invoice: ₹960.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 204.75, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹204.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 231.0, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹231.0
+🔒 Skipped encrypted PDF: invoice_1749408854.956405.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 220.0, 'date_fetched': '2025-05-21'}
+✅ Pushed invoice: ₹220.0
+🔒 Skipped encrypted PDF: invoice_1749408884.76163.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408885.93318.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408887.827838.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408902.614379.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408939.182542.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔒 Skipped encrypted PDF: invoice_1749408946.827224.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 1486.92, 'date_fetched': '2025-05-10'}
+✅ Pushed invoice: ₹1486.92
+✅ Invoice fetching complete. Pushed 5 invoices to FastAPI.
+📥 Connecting to IMAP...
+❌ Error in fetch endpoint: b'[AUTHENTICATIONFAILED] Invalid credentials (Failure)'
+📥 Connecting to IMAP server (universal PDF mode)...
+⚠️ Failed to clear invoices. Status code: 404
+📥 Connecting to IMAP server (universal PDF mode)...
+⚠️ Failed to clear invoices. Status code: 404
+🔐 Skipped encrypted PDF: invoice_1749450782.768222.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450785.434617.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450786.149297.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450788.679071.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📥 Connecting to IMAP server (universal PDF mode)...
+⚠️ Failed to clear invoices. Status code: 404
+📥 Connecting to IMAP server (universal PDF mode)...
+⚠️ Failed to clear invoices. Status code: 404
+🔐 Skipped encrypted PDF: invoice_1749450861.419004.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450867.062462.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450876.78494.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450885.914244.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450895.597514.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450898.932187.pdf
+⚠️ Skipped: Not from known platforms or empty text
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749450908.82928.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📥 Connecting to IMAP server (universal PDF mode)...
+🔐 Skipped encrypted PDF: invoice_1749451015.413312.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749451019.629331.pdf
+⚠️ Skipped: Not from known platforms or empty text
+[2025-06-09 12:49:58] 📨 Received fetch request for user_id 1
+[2025-06-09 12:49:58] 📥 Connecting to Gmail for user farismullen93@gmail.com...
+[2025-06-09 12:50:01] ✅ Login successful.
+[2025-06-09 12:50:01] 🧹 Clearing previous invoices for user 1 via DELETE request...
+
+[📩] Received fetch request for user_id 1
+🔐 Connecting to Gmail for user farismullen93@gmail.com...
+✅ Login successful.
+🧹 Clearing previous invoices for user 1 via DELETE request...
+🗑️ Cleared old invoices.
+❌ Error in fetch endpoint: command SEARCH illegal in state AUTH, only allowed in states SELECTED
+
+[📩] Received fetch request for user_id 1
+🔐 Connecting to Gmail for user farismullen93@gmail.com...
+✅ Login successful.
+📂 Inbox selected successfully.
+🧹 Clearing previous invoices for user 1 via DELETE request...
+❌ Error clearing old invoices: name 'requests' is not defined
+🔐 Skipped encrypted PDF: invoice_1749454583.157888.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454586.969959.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454595.175863.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454602.718603.pdf
+⚠️ Skipped: Not from known platforms or empty text
+
+[📩] Received fetch request for user_id 1
+🔐 Connecting to Gmail for user farismullen93@gmail.com...
+✅ Login successful.
+📂 Inbox selected successfully.
+🧹 Clearing previous invoices for user 1 via DELETE request...
+🗑️ Cleared old invoices.
+🔐 Skipped encrypted PDF: invoice_1749454679.211622.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454684.236838.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454692.823805.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454701.094618.pdf
+⚠️ Skipped: Not from known platforms or empty text
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454740.142945.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454740.590281.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 960.75, 'date_fetched': '2025-05-28'}
+✅ Pushed invoice: ₹960.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 204.75, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹204.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 231.0, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹231.0
+🔐 Skipped encrypted PDF: invoice_1749454790.256007.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 220.0, 'date_fetched': '2025-05-21'}
+✅ Pushed invoice: ₹220.0
+🔐 Skipped encrypted PDF: invoice_1749454821.421842.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454822.846698.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454824.390545.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454838.701684.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454868.817458.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749454875.587418.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 1486.92, 'date_fetched': '2025-05-10'}
+✅ Pushed invoice: ₹1486.92
+✅ Invoice fetching complete. Pushed 5 invoices to FastAPI.
+
+[📩] Received fetch request for user_id 1
+🔐 Connecting to Gmail for user farismullen93@gmail.com...
+✅ Login successful.
+📂 Inbox selected successfully.
+🧹 Clearing previous invoices for user 1 via DELETE request...
+🗑️ Cleared old invoices.
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 1486.92, 'date_fetched': '2025-06-09'}
+✅ Pushed invoice: ₹1486.92
+🔐 Skipped encrypted PDF: invoice_1749492431.929302.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749492436.669608.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749492446.419946.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749492454.515764.pdf
+⚠️ Skipped: Not from known platforms or empty text
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749492493.665089.pdf
+⚠️ Skipped: Not from known platforms or empty text
+🔐 Skipped encrypted PDF: invoice_1749492494.17069.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 960.75, 'date_fetched': '2025-05-28'}
+✅ Pushed invoice: ₹960.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 204.75, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹204.75
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 231.0, 'date_fetched': '2025-05-22'}
+✅ Pushed invoice: ₹231.0
+🔐 Skipped encrypted PDF: invoice_1749492540.52014.pdf
+⚠️ Skipped: Not from known platforms or empty text
+📤 Sending to FastAPI: {'user_id': 1, 'platform': 'Swiggy', 'amount': 220.0, 'date_fetched': '2025-05-21'}
+✅ Pushed invoice: ₹220.0
+✅ Invoice fetching complete. Pushed 5 invoices to FastAPI.

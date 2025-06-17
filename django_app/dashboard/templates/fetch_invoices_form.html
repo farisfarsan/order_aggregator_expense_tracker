@@ -1,0 +1,14 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Fetch Email Invoices</h2>
+<form method="post">
+  {% csrf_token %}
+  <label>Email:</label><br>
+  <input type="email" name="email" required><br><br>
+
+  <label>App Password:</label><br>
+  <input type="password" name="password" required><br><br>
+
+  <button type="submit">Fetch Invoices</button>
+</form>
+{% endblock %}
